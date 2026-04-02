@@ -12,7 +12,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TEMP_DIR = "downloads"
-SEARCH_COUNT = 15  # ← увеличил до 15 треков (3 страницы по 5)
+SEARCH_COUNT = 15
 TRACKS_PER_PAGE = 5
 
 if not BOT_TOKEN:
@@ -60,37 +60,43 @@ def search_tracks(query: str):
     return results
 
 
-# ========= СКАЧИВАНИЕ =========
+# ========= СКАЧИВАНИЕ С КОНВЕРТАЦИЕЙ В M4A =========
 
 def download_track(url: str, title: str):
     safe_name = "".join(c for c in title if c.isalnum() or c in " ._-")
-    filepath = os.path.join(TEMP_DIR, f"{safe_name}.%(ext)s")
+    # Временный шаблон (без расширения, добавится автоматически)
+    temp_template = os.path.join(TEMP_DIR, f"{safe_name}.%(ext)s")
 
     ydl_opts = {
-        'format': 'bestaudio',
-        'outtmpl': filepath,
+        'format': 'bestaudio[ext=m4a]/bestaudio',  # Приоритет M4A
+        'outtmpl': temp_template,
         'quiet': True,
         'noplaylist': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'm4a',      # Конвертируем в M4A
+            'preferredquality': '192',     # Битрейт 192 kbps
+        }],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
+        # Получаем имя файла без расширения
+        base_filename = ydl.prepare_filename(info)
+        # Убираем старое расширение и добавляем .m4a
+        filename = os.path.splitext(base_filename)[0] + '.m4a'
 
     return filename
 
 
-# ========= ФУНКЦИЯ ДЛЯ СОЗДАНИЯ КЛАВИАТУРЫ С ПАГИНАЦИЕЙ =========
+# ========= КЛАВИАТУРА С ПАГИНАЦИЕЙ =========
 
 def create_pagination_keyboard(tracks: list, page: int):
-    """Создает инлайн-клавиатуру с треками и кнопками пагинации"""
     keyboard = []
     
-    # Вычисляем индексы для текущей страницы
     start_idx = page * TRACKS_PER_PAGE
     end_idx = min(start_idx + TRACKS_PER_PAGE, len(tracks))
     
-    # Добавляем кнопки с треками
     for i in range(start_idx, end_idx):
         track = tracks[i]
         button_text = f"{i+1}. {track['artist']} - {track['title']}"[:60]
@@ -99,7 +105,6 @@ def create_pagination_keyboard(tracks: list, page: int):
             callback_data=f"dl_{i}"
         )])
     
-    # Добавляем кнопки пагинации (если нужно)
     nav_buttons = []
     total_pages = (len(tracks) + TRACKS_PER_PAGE - 1) // TRACKS_PER_PAGE
     
@@ -118,7 +123,6 @@ def create_pagination_keyboard(tracks: list, page: int):
     if nav_buttons:
         keyboard.append(nav_buttons)
     
-    # Добавляем информационную кнопку
     keyboard.append([InlineKeyboardButton(
         text=f"📄 Страница {page + 1} из {total_pages} | Всего: {len(tracks)} треков",
         callback_data="info"
@@ -146,23 +150,21 @@ async def search_music(message: types.Message):
         await msg.edit_text("❌ Ничего не найдено")
         return
 
-    # Сохраняем в кеш
+    # Кеш с пагинацией
     if not hasattr(search_music, "cache"):
         search_music.cache = {}
     
     search_music.cache[message.chat.id] = {
         "tracks": tracks,
-        "page": 0  # текущая страница
+        "page": 0
     }
 
-    # Показываем первую страницу
     keyboard = create_pagination_keyboard(tracks, 0)
     await msg.edit_text("🎵 Выбери трек:", reply_markup=keyboard)
 
 
 @dp.callback_query(lambda c: c.data.startswith("page_"))
 async def change_page(callback: types.CallbackQuery):
-    """Обработчик смены страницы"""
     page = int(callback.data.split("_")[1])
     
     cache_data = getattr(search_music, "cache", {}).get(callback.message.chat.id)
@@ -174,7 +176,6 @@ async def change_page(callback: types.CallbackQuery):
     tracks = cache_data["tracks"]
     cache_data["page"] = page
     
-    # Обновляем клавиатуру
     keyboard = create_pagination_keyboard(tracks, page)
     await callback.message.edit_reply_markup(reply_markup=keyboard)
     await callback.answer()
@@ -199,21 +200,20 @@ async def download_selected(callback: types.CallbackQuery):
     track = tracks[index]
 
     # Отправляем статус в отдельное сообщение
-    status_msg = await callback.message.answer(f"⏳ Качаю: {track['artist']} - {track['title']}...")
+    status_msg = await callback.message.answer(f"⏳ Качаю и конвертирую: {track['artist']} - {track['title']}...")
 
     try:
         filepath = download_track(track["url"], track["title"])
 
-        # Отправляем аудио с указанием исполнителя
+        # Отправляем аудио с указанием исполнителя (теперь точно M4A)
         await callback.message.answer_audio(
             audio=FSInputFile(filepath),
             title=track['title'],
             performer=track['artist']
         )
 
+        # Удаляем файл и статусное сообщение
         os.remove(filepath)
-        
-        # Удаляем статусное сообщение
         await status_msg.delete()
         
         await callback.answer(f"✅ {track['artist']} - {track['title']} отправлен!")
@@ -226,15 +226,15 @@ async def download_selected(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "info")
 async def info_button(callback: types.CallbackQuery):
-    """Просто отвечаем на кнопку с информацией"""
     await callback.answer("Используй кнопки Назад/Вперед для навигации")
 
 
 # ========= ЗАПУСК =========
 
 async def main():
-    print("🚀 Bot started (with pagination!)")
-    print(f"📊 Showing {TRACKS_PER_PAGE} tracks per page")
+    print("🚀 Music Bot started!")
+    print(f"📊 Search: {SEARCH_COUNT} tracks, {TRACKS_PER_PAGE} per page")
+    print("🎵 Все треки конвертируются в M4A для правильного отображения")
     await dp.start_polling(bot)
 
 
