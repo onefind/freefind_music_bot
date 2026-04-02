@@ -1,28 +1,145 @@
 import os
 import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
 import yt_dlp
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramForbiddenError
 
-# ========= НАСТРОЙКИ =========
+# ========= НАСТРОЙКИ ИЗ .ENV =========
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+LOG_BOT_TOKEN = os.getenv("LOG_BOT_TOKEN")
+LOG_CHAT_ID = os.getenv("LOG_CHAT_ID")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))  # Преобразуем в int
+
 TEMP_DIR = "downloads"
 SEARCH_COUNT = 15
 TRACKS_PER_PAGE = 5
 
+# Проверки обязательных переменных
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден")
+    raise ValueError("BOT_TOKEN не найден в .env")
+
+if not CHANNEL_USERNAME:
+    raise ValueError("CHANNEL_USERNAME не найден в .env")
+
+if not CHANNEL_ID:
+    raise ValueError("CHANNEL_ID не найден в .env")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Создаём отдельного бота для отправки логов (если токен указан)
+log_bot = Bot(token=LOG_BOT_TOKEN) if LOG_BOT_TOKEN else None
+
 if not os.path.exists(TEMP_DIR):
     os.makedirs(TEMP_DIR)
+
+
+# ========= ФУНКЦИИ ДЛЯ ЛОГОВ =========
+
+async def send_log(message: str, error: bool = False):
+    """Отправляет лог в отдельного бота"""
+    if not log_bot or not LOG_CHAT_ID:
+        print("⚠️ Логи не настроены (нет LOG_BOT_TOKEN или LOG_CHAT_ID)")
+        return
+    
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        emoji = "❌" if error else "✅"
+        
+        log_text = f"""
+{emoji} **Лог бота**
+
+📅 **Время:** `{timestamp}`
+📝 **Сообщение:** {message}
+        """
+        
+        await log_bot.send_message(
+            chat_id=LOG_CHAT_ID,
+            text=log_text,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"❌ Не удалось отправить лог: {e}")
+
+
+async def send_startup_log():
+    """Отправляет подробный лог при запуске"""
+    if not log_bot or not LOG_CHAT_ID:
+        return
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    log_text = f"""
+🚀 **БОТ ЗАПУЩЕН!**
+
+📅 **Дата и время:** `{timestamp}`
+🤖 **Статус:** Работает
+🔐 **Проверка канала:** {CHANNEL_USERNAME}
+📊 **Настройки:** {SEARCH_COUNT} треков, {TRACKS_PER_PAGE} на странице
+🎵 **Формат:** M4A (192 kbps)
+        """
+    
+    await log_bot.send_message(
+        chat_id=LOG_CHAT_ID,
+        text=log_text,
+        parse_mode="Markdown"
+    )
+    print("✅ Стартовый лог отправлен")
+
+
+# ========= ПРОВЕРКА ПОДПИСКИ =========
+
+async def check_subscription(user_id: int) -> bool:
+    """Проверяет, подписан ли пользователь на канал"""
+    try:
+        chat_member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        
+        subscribed_statuses = ["creator", "administrator", "member"]
+        
+        return chat_member.status in subscribed_statuses
+        
+    except TelegramForbiddenError:
+        print(f"⚠️ Бот не может проверить подписку пользователя {user_id}")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка проверки подписки: {e}")
+        return False
+
+
+async def require_subscription(message: types.Message) -> bool:
+    """Проверяет подписку и отправляет сообщение, если не подписан"""
+    user_id = message.from_user.id
+    
+    if await check_subscription(user_id):
+        return True
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📢 ПОДПИСАТЬСЯ НА КАНАЛ",
+                url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}"
+            )],
+            [InlineKeyboardButton(
+                text="✅ ПРОВЕРИТЬ ПОДПИСКУ",
+                callback_data="check_sub"
+            )]
+        ])
+        
+        await message.answer(
+            "❌ **Доступ запрещён!**\n\n"
+            "Для использования бота необходимо подписаться на наш канал.\n\n"
+            "👇 **Нажми на кнопку ниже, подпишись, а затем нажми «ПРОВЕРИТЬ ПОДПИСКУ»**",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        return False
 
 
 # ========= ПОИСК (С ИСПОЛНИТЕЛЕМ) =========
@@ -42,7 +159,6 @@ def search_tracks(query: str):
 
     results = []
     for entry in info["entries"]:
-        # Пробуем разные поля для исполнителя
         artist = (
             entry.get("artist") or 
             entry.get("uploader") or 
@@ -64,26 +180,23 @@ def search_tracks(query: str):
 
 def download_track(url: str, title: str):
     safe_name = "".join(c for c in title if c.isalnum() or c in " ._-")
-    # Временный шаблон (без расширения, добавится автоматически)
     temp_template = os.path.join(TEMP_DIR, f"{safe_name}.%(ext)s")
 
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio',  # Приоритет M4A
+        'format': 'bestaudio[ext=m4a]/bestaudio',
         'outtmpl': temp_template,
         'quiet': True,
         'noplaylist': True,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'm4a',      # Конвертируем в M4A
-            'preferredquality': '192',     # Битрейт 192 kbps
+            'preferredcodec': 'm4a',
+            'preferredquality': '192',
         }],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # Получаем имя файла без расширения
         base_filename = ydl.prepare_filename(info)
-        # Убираем старое расширение и добавляем .m4a
         filename = os.path.splitext(base_filename)[0] + '.m4a'
 
     return filename
@@ -135,36 +248,86 @@ def create_pagination_keyboard(tracks: list, page: int):
 
 @dp.message(CommandStart())
 async def start(message: types.Message):
-    await message.answer("🎵 Напиши название трека")
+    # Логируем запуск пользователя
+    await send_log(f"Пользователь @{message.from_user.username or message.from_user.id} запустил бота")
+    
+    if await require_subscription(message):
+        await message.answer(
+            "🎵 **Привет от @mpsfind**\n\n"
+            "Просто напиши название трека или исполнителя, и я найду музыку на SoundCloud.\n\n"
+            "📌 **Доступно:**\n\n"
+            "• Поиск до 15 треков\n"
+            "• Пагинация результатов\n"
+            "• Качество 192 kbps в формате MP3\n"
+            "• Отображение исполнителя\n\n"
+            "🔍 **Попробуй:** `Imagine Dragons` или `Billie Eilish`",
+            parse_mode="Markdown"
+        )
+
+
+@dp.callback_query(lambda c: c.data == "check_sub")
+async def check_subscription_callback(callback: types.CallbackQuery):
+    """Проверка подписки по кнопке"""
+    user_id = callback.from_user.id
+    
+    if await check_subscription(user_id):
+        await callback.message.delete()
+        await callback.message.answer(
+            "✅ **Подписка подтверждена!**\n\n"
+            "🎵 Теперь ты можешь пользоваться ботом.\n"
+            "Просто напиши название трека или исполнителя.",
+            parse_mode="Markdown"
+        )
+        await callback.answer("Доступ разрешён!")
+        await send_log(f"Пользователь @{callback.from_user.username or user_id} подписался на канал")
+    else:
+        await callback.answer(
+            "❌ Вы ещё не подписались на канал!\n"
+            "Подпишитесь и нажмите «ПРОВЕРИТЬ ПОДПИСКУ» снова",
+            show_alert=True
+        )
 
 
 @dp.message()
 async def search_music(message: types.Message):
+    if not await require_subscription(message):
+        return
+    
     query = message.text.strip()
-
     msg = await message.answer("🔍 Ищу...")
 
-    tracks = search_tracks(query)
+    try:
+        tracks = search_tracks(query)
 
-    if not tracks:
-        await msg.edit_text("❌ Ничего не найдено")
-        return
+        if not tracks:
+            await msg.edit_text("❌ Ничего не найдено")
+            return
 
-    # Кеш с пагинацией
-    if not hasattr(search_music, "cache"):
-        search_music.cache = {}
-    
-    search_music.cache[message.chat.id] = {
-        "tracks": tracks,
-        "page": 0
-    }
+        if not hasattr(search_music, "cache"):
+            search_music.cache = {}
+        
+        search_music.cache[message.chat.id] = {
+            "tracks": tracks,
+            "page": 0
+        }
 
-    keyboard = create_pagination_keyboard(tracks, 0)
-    await msg.edit_text("🎵 Выбери трек:", reply_markup=keyboard)
+        keyboard = create_pagination_keyboard(tracks, 0)
+        await msg.edit_text("🎵 Выбери трек:", reply_markup=keyboard)
+        
+        # Логируем поиск
+        await send_log(f"Пользователь искал: '{query}' (найдено {len(tracks)} треков)")
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка при поиске: {e}")
+        await send_log(f"Ошибка поиска: {e}", error=True)
 
 
 @dp.callback_query(lambda c: c.data.startswith("page_"))
 async def change_page(callback: types.CallbackQuery):
+    if not await check_subscription(callback.from_user.id):
+        await callback.answer("❌ Доступ запрещён! Подпишись на @mpsfindblog", show_alert=True)
+        return
+    
     page = int(callback.data.split("_")[1])
     
     cache_data = getattr(search_music, "cache", {}).get(callback.message.chat.id)
@@ -183,6 +346,10 @@ async def change_page(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("dl_"))
 async def download_selected(callback: types.CallbackQuery):
+    if not await check_subscription(callback.from_user.id):
+        await callback.answer("❌ Доступ запрещён! Подпишитесь на канал.", show_alert=True)
+        return
+    
     index = int(callback.data.split("_")[1])
     
     cache_data = getattr(search_music, "cache", {}).get(callback.message.chat.id)
@@ -198,30 +365,27 @@ async def download_selected(callback: types.CallbackQuery):
         return
     
     track = tracks[index]
-
-    # Отправляем статус в отдельное сообщение
     status_msg = await callback.message.answer(f"⏳ Качаю и конвертирую: {track['artist']} - {track['title']}...")
 
     try:
         filepath = download_track(track["url"], track["title"])
 
-        # Отправляем аудио с указанием исполнителя (теперь точно M4A)
         await callback.message.answer_audio(
             audio=FSInputFile(filepath),
             title=track['title'],
             performer=track['artist']
         )
 
-        # Удаляем файл и статусное сообщение
         os.remove(filepath)
         await status_msg.delete()
-        
         await callback.answer(f"✅ {track['artist']} - {track['title']} отправлен!")
+        
+        # Логируем скачивание
+        await send_log(f"Пользователь скачал: {track['artist']} - {track['title']}")
 
     except Exception as e:
         await status_msg.edit_text(f"❌ Ошибка: {e}")
-
-    # Не удаляем исходное сообщение с вариантами
+        await send_log(f"Ошибка скачивания {track['artist']} - {track['title']}: {e}", error=True)
 
 
 @dp.callback_query(lambda c: c.data == "info")
@@ -234,7 +398,11 @@ async def info_button(callback: types.CallbackQuery):
 async def main():
     print("🚀 Music Bot started!")
     print(f"📊 Search: {SEARCH_COUNT} tracks, {TRACKS_PER_PAGE} per page")
-    print("🎵 Все треки конвертируются в M4A для правильного отображения")
+    print(f"🔐 Проверка канала: {CHANNEL_USERNAME}")
+    
+    # Отправляем стартовый лог
+    await send_startup_log()
+    
     await dp.start_polling(bot)
 
 
