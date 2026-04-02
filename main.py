@@ -42,12 +42,29 @@ if not os.path.exists(TEMP_DIR):
     os.makedirs(TEMP_DIR)
 
 
-# ========= ФУНКЦИИ ДЛЯ ЛОГОВ (ТОЛЬКО ЗАПУСК) =========
+# ========= ФУНКЦИИ ДЛЯ ЛОГОВ =========
+
+async def send_log(message: str):
+    """Отправляет лог в отдельного бота"""
+    if not log_bot or not LOG_CHAT_ID:
+        return
+    
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_text = f"📅 `{timestamp}`\n📝 {message}"
+        
+        await log_bot.send_message(
+            chat_id=LOG_CHAT_ID,
+            text=log_text,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"❌ Не удалось отправить лог: {e}")
+
 
 async def send_startup_log():
-    """Отправляет лог только при запуске бота"""
+    """Отправляет лог при запуске бота"""
     if not log_bot or not LOG_CHAT_ID:
-        print("⚠️ Логи не настроены (нет LOG_BOT_TOKEN или LOG_CHAT_ID)")
         return
     
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -57,7 +74,7 @@ async def send_startup_log():
 
 📅 **Время:** `{timestamp}`
 🔐 **Канал:** {CHANNEL_USERNAME}
-🎵 **Формат:** MP3 (192 kbps)
+🎵 **Формат:** MP3
     """
     
     await log_bot.send_message(
@@ -221,6 +238,9 @@ def create_pagination_keyboard(tracks: list, page: int):
 
 @dp.message(CommandStart())
 async def start(message: types.Message):
+    # Лог только команды /start
+    await send_log(f"👤 Пользователь @{message.from_user.username or message.from_user.id} нажал /start")
+    
     if await require_subscription(message):
         await message.answer(
             "🎵 **Привет от @mpsfind**\n\n"
@@ -358,10 +378,8 @@ async def info_button(callback: types.CallbackQuery):
 
 async def main():
     print("🚀 Music Bot started!")
-    print(f"📊 Search: {SEARCH_COUNT} tracks, {TRACKS_PER_PAGE} per page")
-    print(f"🔐 Проверка канала: {CHANNEL_USERNAME}")
     
-    # Отправляем ТОЛЬКО стартовый лог
+    # Лог запуска бота
     await send_startup_log()
     
     await dp.start_polling(bot)
