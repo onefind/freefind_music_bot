@@ -1,4 +1,7 @@
 {
+  "build": {
+    "buildAptPackages": ["ffmpeg"]
+  },
   "deploy": {
     "startCommand": "python main.py"
   }
